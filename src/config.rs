@@ -156,7 +156,10 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];
+// Nemo: private-network-only fork. The public RustDesk rendezvous network is
+// never used, so there is no public fallback server. Clients must be configured
+// with a custom-rendezvous-server (the company server).
+pub const RENDEZVOUS_SERVERS: &[&str] = &[];
 pub const RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
@@ -2314,7 +2317,9 @@ impl UserDefaultConfig {
                 self.get_string(key, "scrollauto", vec!["scrolledge", "scrollbar"])
             }
             keys::OPTION_IMAGE_QUALITY => {
-                self.get_string(key, "balanced", vec!["best", "low", "custom"])
+                // Nemo: default to "low" (Optimize reaction time) for low-latency
+                // remote control of CAD/3D workstations.
+                self.get_string(key, "low", vec!["best", "balanced", "custom"])
             }
             keys::OPTION_CODEC_PREFERENCE => {
                 self.get_string(key, "auto", vec!["vp8", "vp9", "av1", "h264", "h265"])
