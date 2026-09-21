@@ -2330,11 +2330,11 @@ impl UserDefaultConfig {
                 // itself, which is the mechanism that was supposed to handle this. So the
                 // low default gave up quality on good links without helping on bad ones.
                 //
-                // Back to upstream's "balanced". Sites wanting more should push
-                // image_quality=custom + custom_image_quality=300 to the LAN operators
-                // (see DEPLOY.md); `custom` is now safe over a WAN too, since its ABR
-                // floor is a fraction of the user's own target rather than the absolute
-                // 1% floor.
+                // Back to upstream's "balanced". Note this is a PER-PEER setting on
+                // the machine the operator sits at, not a workstation setting -- so a
+                // LAN operator and a technician on a constrained uplink can and should
+                // carry different values. Size it to the link, not to the machine.
+                // See DEPLOY.md.
                 self.get_string(key, "balanced", vec!["best", "low", "custom"])
             }
             keys::OPTION_CODEC_PREFERENCE => {
