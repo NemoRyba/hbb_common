@@ -34,41 +34,30 @@ pub enum Role {
     Responder,
 }
 
-/// Version byte sealed alongside the symmetric key. Its presence is what tells the
-/// responder that the initiator uses per-direction nonces (SEC-14). It rides INSIDE
-/// the sealed box, so an on-path attacker cannot strip it to force the old shared
-/// nonce space back -- doing that would need the recipient's secret key.
+/// Version byte sealed alongside the symmetric key, and the only shape accepted.
+/// It rides INSIDE the sealed box, so an on-path attacker cannot strip or rewrite
+/// it -- that would need the recipient's secret key.
 pub const SESSION_KEY_V1: u8 = 1;
 
-/// A negotiated session key: the symmetric key, which side of the handshake we are,
-/// and whether the peer agreed to per-direction nonces.
+/// A negotiated session key: the symmetric key and which side of the handshake we
+/// are. Per-direction nonces are unconditional; there is no mode in which the two
+/// directions share a nonce space.
+///
+/// Deliberately NOT `Debug`: it holds key material, and a derived impl would print
+/// it into any `{:?}` that happens to include it.
 #[derive(Clone)]
 pub struct SessionKey {
     pub key: Key,
     pub role: Role,
-    /// False only against a pre-SEC-14 peer, which seals a bare 32-byte key. Both
-    /// directions then share one nonce space, exactly as before.
-    pub directional: bool,
 }
 
 impl SessionKey {
-    /// A key we negotiated ourselves, with per-direction nonces.
     pub fn new(key: Key, role: Role) -> Self {
-        Self {
-            key,
-            role,
-            directional: true,
-        }
+        Self { key, role }
     }
 
-    /// Direction bytes, as (send, receive). The initiator sends with 0, which is
-    /// byte-for-byte what the old code did in BOTH directions -- so the change is
-    /// confined to the responder->initiator leg, and a v1 initiator's frames stay
-    /// readable by anything that got past the handshake.
+    /// Direction bytes, as (send, receive).
     fn dirs(&self) -> (u8, u8) {
-        if !self.directional {
-            return (0, 0);
-        }
         match self.role {
             Role::Initiator => (0, 1),
             Role::Responder => (1, 0),
@@ -391,10 +380,11 @@ impl Encrypt {
         secretbox::seal(&data, &nonce, &self.0)
     }
 
-    /// Open the symmetric key the INITIATOR sealed to us, and report whether it
-    /// carried the SEC-14 version marker. A bare 32-byte key means a pre-SEC-14 peer
-    /// and keeps the old shared nonce space; 33 bytes means per-direction nonces.
-    /// Any other length or version is refused rather than guessed at.
+    /// Open the symmetric key the INITIATOR sealed to us. It must be
+    /// `key || SESSION_KEY_V1`; a bare 32-byte key is the pre-SEC-14 shape, in which
+    /// both directions share one nonce space, and is refused outright rather than
+    /// accepted as a fallback. There is no fleet that needs it, so there is no reason
+    /// to keep a code path that silently reinstates a two-time pad.
     pub fn decode(
         symmetric_data: &[u8],
         their_pk_b: &[u8],
@@ -409,26 +399,27 @@ impl Encrypt {
         let their_pk_b = box_::PublicKey(pk_);
         let symmetric_key = box_::open(symmetric_data, &nonce, &their_pk_b, &our_sk_b)
             .map_err(|_| anyhow::anyhow!("Handshake failed: box decryption failure"))?;
-        let directional = if symmetric_key.len() == secretbox::KEYBYTES {
-            false
-        } else if symmetric_key.len() == secretbox::KEYBYTES + 1 {
-            let version = symmetric_key[secretbox::KEYBYTES];
-            if version != SESSION_KEY_V1 {
-                anyhow::bail!("Handshake failed: unknown session key version {}", version);
-            }
-            true
-        } else {
+        if symmetric_key.len() == secretbox::KEYBYTES {
+            anyhow::bail!(
+                "Handshake failed: peer sealed a pre-SEC-14 session key (no version byte); \
+                 that shape shares one nonce space between both directions and is refused"
+            );
+        }
+        if symmetric_key.len() != secretbox::KEYBYTES + 1 {
             anyhow::bail!(
                 "Handshake failed: invalid secret key length {} from peer",
                 symmetric_key.len()
             );
-        };
+        }
+        let version = symmetric_key[secretbox::KEYBYTES];
+        if version != SESSION_KEY_V1 {
+            anyhow::bail!("Handshake failed: unknown session key version {}", version);
+        }
         let mut key = [0u8; secretbox::KEYBYTES];
         key[..].copy_from_slice(&symmetric_key[..secretbox::KEYBYTES]);
         Ok(SessionKey {
             key: Key(key),
             role: Role::Responder,
-            directional,
         })
     }
 }
@@ -437,20 +428,24 @@ impl Encrypt {
 mod tests {
     use super::*;
     use bytes::BytesMut;
+    use sodiumoxide::crypto::box_;
 
-    fn pair(directional: bool) -> (Encrypt, Encrypt) {
+    fn pair() -> (Encrypt, Encrypt) {
         let key = secretbox::gen_key();
         (
-            Encrypt::new(SessionKey {
-                key: key.clone(),
-                role: Role::Initiator,
-                directional,
-            }),
-            Encrypt::new(SessionKey {
-                key,
-                role: Role::Responder,
-                directional,
-            }),
+            Encrypt::new(SessionKey::new(key.clone(), Role::Initiator)),
+            Encrypt::new(SessionKey::new(key, Role::Responder)),
+        )
+    }
+
+    /// The pre-SEC-14 shape: one key, one nonce space, both directions. No longer
+    /// reachable through any public constructor -- built here only so the assertion
+    /// that it WAS broken stays in the suite.
+    fn legacy_pair() -> (Encrypt, Encrypt) {
+        let key = secretbox::gen_key();
+        (
+            Encrypt(key.clone(), 0, 0, 0, 0),
+            Encrypt(key, 0, 0, 0, 0),
         )
     }
 
@@ -461,14 +456,14 @@ mod tests {
     /// that the old shape really did collide, and that the new one does not.
     #[test]
     fn directions_do_not_share_a_nonce_space() {
-        let (mut legacy_i, mut legacy_r) = pair(false);
+        let (mut legacy_i, mut legacy_r) = legacy_pair();
         assert_eq!(
             legacy_i.enc(b"same plaintext"),
             legacy_r.enc(b"same plaintext"),
             "pre-SEC-14 shape: two directions, one nonce space, one key (two-time pad)"
         );
 
-        let (mut i, mut r) = pair(true);
+        let (mut i, mut r) = pair();
         assert_ne!(
             i.enc(b"same plaintext"),
             r.enc(b"same plaintext"),
@@ -480,7 +475,7 @@ mod tests {
     /// would be caught here rather than by a silent stall on a real connection.
     #[test]
     fn a_directional_pair_round_trips_both_ways() {
-        let (mut i, mut r) = pair(true);
+        let (mut i, mut r) = pair();
         for n in 0..4u8 {
             let msg = [b'i', n];
             let mut wire = BytesMut::from(&i.enc(&msg)[..]);
@@ -494,47 +489,46 @@ mod tests {
         }
     }
 
-    /// Against a pre-SEC-14 peer both ends fall back to the old shared nonce space,
-    /// so an un-updated peer keeps working exactly as before.
+    /// A pre-SEC-14 peer seals a bare 32-byte key. That is refused at the handshake,
+    /// so there is no path back to the shared nonce space -- not by an on-path
+    /// attacker, and not by an un-updated peer either.
     #[test]
-    fn a_legacy_pair_round_trips_both_ways() {
-        let (mut i, mut r) = pair(false);
-        let mut wire = BytesMut::from(&i.enc(b"hello")[..]);
-        r.dec(&mut wire).expect("responder decrypts");
-        assert_eq!(&wire[..], b"hello");
-        let mut wire = BytesMut::from(&r.enc(b"world")[..]);
-        i.dec(&mut wire).expect("initiator decrypts");
-        assert_eq!(&wire[..], b"world");
-    }
-
-    /// The initiator's SEND direction is 0, which is byte-for-byte what the old code
-    /// did in both directions. That is deliberate: it keeps the change confined to
-    /// the responder->initiator leg.
-    #[test]
-    fn the_initiator_send_leg_is_unchanged_from_the_legacy_shape() {
+    fn a_pre_sec14_session_key_is_refused() {
+        // The initiator (them) seals to the responder's public key with its own
+        // secret; the responder opens with (their_pk, our_sk). Getting that pair the
+        // wrong way round fails as a box error, not as a version error, which is why
+        // the assertions below check the message and not just is_err().
+        let (their_pk, their_sk) = box_::gen_keypair();
+        let (our_pk, our_sk) = box_::gen_keypair();
         let key = secretbox::gen_key();
-        let mut v1 = Encrypt::new(SessionKey::new(key.clone(), Role::Initiator));
-        let mut legacy = Encrypt::new(SessionKey {
-            key,
-            role: Role::Initiator,
-            directional: false,
-        });
-        assert_eq!(v1.enc(b"first frame"), legacy.enc(b"first frame"));
-    }
+        let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
+        let seal = |payload: &[u8]| box_::seal(payload, &nonce, &our_pk, &their_sk);
 
-    /// Mixing the modes must FAIL to decrypt rather than silently produce garbage --
-    /// a half-updated fleet gets a clean error, never a corrupted stream.
-    #[test]
-    fn a_directional_responder_cannot_be_read_by_a_legacy_initiator() {
-        let key = secretbox::gen_key();
-        let mut v1_r = Encrypt::new(SessionKey::new(key.clone(), Role::Responder));
-        let mut legacy_i = Encrypt::new(SessionKey {
-            key,
-            role: Role::Initiator,
-            directional: false,
-        });
-        let mut wire = BytesMut::from(&v1_r.enc(b"reply")[..]);
-        assert!(legacy_i.dec(&mut wire).is_err());
+        // 32 bytes: the old shape.
+        let legacy = seal(&key.0);
+        let err = match Encrypt::decode(&legacy, &their_pk.0, &our_sk) {
+            Ok(_) => panic!("a pre-SEC-14 session key must not be accepted"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("pre-SEC-14"), "{}", err);
+
+        // 33 bytes with the right version: accepted.
+        let mut ok_payload = key.0.to_vec();
+        ok_payload.push(SESSION_KEY_V1);
+        let good = seal(&ok_payload);
+        let session = Encrypt::decode(&good, &their_pk.0, &our_sk).expect("v1 opens");
+        assert_eq!(session.key, key);
+        assert_eq!(session.role, Role::Responder);
+
+        // 33 bytes with any other version: refused, so a future v2 is never misread.
+        let mut v2_payload = key.0.to_vec();
+        v2_payload.push(SESSION_KEY_V1 + 1);
+        let v2 = seal(&v2_payload);
+        let v2_err = match Encrypt::decode(&v2, &their_pk.0, &our_sk) {
+            Ok(_) => panic!("an unknown session key version must not be accepted"),
+            Err(e) => e.to_string(),
+        };
+        assert!(v2_err.contains("unknown session key version"), "{}", v2_err);
     }
 
     /// The direction byte sits just past the counter, so it can never collide with a
