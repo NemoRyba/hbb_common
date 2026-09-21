@@ -54,6 +54,19 @@ impl Stream {
         }
     }
 
+    /// Drop the session cipher while keeping the codec framing. Used by the relay
+    /// path, which encrypts only the RequestRelay control frame and then passes the
+    /// peer-to-peer payload through untouched.
+    #[inline]
+    pub fn clear_key(&mut self) {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(s) => s.set_raw(),
+            Stream::WebSocket(s) => s.clear_key(),
+            Stream::Tcp(s) => s.clear_key(),
+        }
+    }
+
     #[inline]
     pub fn set_key(&mut self, key: Key) {
         match self {

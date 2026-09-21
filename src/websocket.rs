@@ -203,6 +203,14 @@ impl WsFramedStream {
         self.encrypt = None;
     }
 
+    /// Same as `set_raw` here (a websocket frame is already message-oriented, so there
+    /// is no codec mode to switch); kept as its own name so the relay path reads the
+    /// same on every transport.
+    #[inline]
+    pub fn clear_key(&mut self) {
+        self.encrypt = None;
+    }
+
     #[inline]
     pub async fn from_tcp_stream(stream: TcpStream, addr: SocketAddr) -> ResultType<Self> {
         let ws_stream =

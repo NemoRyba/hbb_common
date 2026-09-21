@@ -145,6 +145,18 @@ impl FramedStream {
         self.2 = None;
     }
 
+    /// Drop the session cipher but KEEP the current codec framing.
+    ///
+    /// `set_raw()` does both, which is wrong for the relay: hbbr encrypts only the
+    /// RequestRelay control frame and must then pass the relayed payload through
+    /// untouched (that payload is already end-to-end encrypted between the two
+    /// peers, so re-encrypting it would be pure cost). Switching the codec to raw
+    /// at that point would also desync framing when the two halves of a relayed
+    /// pair disagree about raw mode.
+    pub fn clear_key(&mut self) {
+        self.2 = None;
+    }
+
     pub fn is_secured(&self) -> bool {
         self.2.is_some()
     }
