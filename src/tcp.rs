@@ -24,8 +24,61 @@ use tokio_util::codec::Framed;
 pub trait TcpStreamTrait: AsyncRead + AsyncWrite + Unpin {}
 pub struct DynTcpStream(pub(crate) Box<dyn TcpStreamTrait + Send + Sync>);
 
+/// Which side of a key exchange this cipher belongs to. The side that GENERATES the
+/// symmetric key is the initiator; the side that opens it with `Encrypt::decode` is
+/// the responder. That holds for every handshake in this codebase -- rendezvous,
+/// relay, and both peer-to-peer paths -- so the role needs no negotiation of its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role {
+    Initiator,
+    Responder,
+}
+
+/// Version byte sealed alongside the symmetric key. Its presence is what tells the
+/// responder that the initiator uses per-direction nonces (SEC-14). It rides INSIDE
+/// the sealed box, so an on-path attacker cannot strip it to force the old shared
+/// nonce space back -- doing that would need the recipient's secret key.
+pub const SESSION_KEY_V1: u8 = 1;
+
+/// A negotiated session key: the symmetric key, which side of the handshake we are,
+/// and whether the peer agreed to per-direction nonces.
 #[derive(Clone)]
-pub struct Encrypt(Key, u64, u64);
+pub struct SessionKey {
+    pub key: Key,
+    pub role: Role,
+    /// False only against a pre-SEC-14 peer, which seals a bare 32-byte key. Both
+    /// directions then share one nonce space, exactly as before.
+    pub directional: bool,
+}
+
+impl SessionKey {
+    /// A key we negotiated ourselves, with per-direction nonces.
+    pub fn new(key: Key, role: Role) -> Self {
+        Self {
+            key,
+            role,
+            directional: true,
+        }
+    }
+
+    /// Direction bytes, as (send, receive). The initiator sends with 0, which is
+    /// byte-for-byte what the old code did in BOTH directions -- so the change is
+    /// confined to the responder->initiator leg, and a v1 initiator's frames stay
+    /// readable by anything that got past the handshake.
+    fn dirs(&self) -> (u8, u8) {
+        if !self.directional {
+            return (0, 0);
+        }
+        match self.role {
+            Role::Initiator => (0, 1),
+            Role::Responder => (1, 0),
+        }
+    }
+}
+
+/// key, send counter, receive counter, send direction, receive direction.
+#[derive(Clone)]
+pub struct Encrypt(Key, u64, u64, u8, u8);
 
 pub struct FramedStream(
     pub(crate) Framed<DynTcpStream, BytesCodec>,
@@ -208,13 +261,18 @@ impl FramedStream {
         }
     }
 
-    pub fn set_key(&mut self, key: Key) {
-        self.2 = Some(Encrypt::new(key));
+    pub fn set_key(&mut self, session: SessionKey) {
+        self.2 = Some(Encrypt::new(session));
     }
 
-    fn get_nonce(seqnum: u64) -> Nonce {
+    fn get_nonce(seqnum: u64, dir: u8) -> Nonce {
         let mut nonce = Nonce([0u8; secretbox::NONCEBYTES]);
         nonce.0[..std::mem::size_of_val(&seqnum)].copy_from_slice(&seqnum.to_le_bytes());
+        // SEC-14: this byte is what separates the two directions' nonce spaces.
+        // Without it both ends derive the SAME nonce from their own counters, and
+        // with one shared key frame #1 in each direction reuses the XSalsa20
+        // keystream -- a two-time pad on every connection, from the first frame.
+        nonce.0[std::mem::size_of_val(&seqnum)] = dir;
         nonce
     }
 }
@@ -306,8 +364,9 @@ impl AsyncWrite for DynTcpStream {
 impl<R: AsyncRead + AsyncWrite + Unpin> TcpStreamTrait for R {}
 
 impl Encrypt {
-    pub fn new(key: Key) -> Self {
-        Self(key, 0, 0)
+    pub fn new(session: SessionKey) -> Self {
+        let (send_dir, recv_dir) = session.dirs();
+        Self(session.key, 0, 0, send_dir, recv_dir)
     }
 
     pub fn dec(&mut self, bytes: &mut BytesMut) -> Result<(), Error> {
@@ -315,7 +374,7 @@ impl Encrypt {
             return Ok(());
         }
         self.2 += 1;
-        let nonce = FramedStream::get_nonce(self.2);
+        let nonce = FramedStream::get_nonce(self.2, self.4);
         match secretbox::open(bytes, &nonce, &self.0) {
             Ok(res) => {
                 bytes.clear();
@@ -328,15 +387,19 @@ impl Encrypt {
 
     pub fn enc(&mut self, data: &[u8]) -> Vec<u8> {
         self.1 += 1;
-        let nonce = FramedStream::get_nonce(self.1);
+        let nonce = FramedStream::get_nonce(self.1, self.3);
         secretbox::seal(&data, &nonce, &self.0)
     }
 
+    /// Open the symmetric key the INITIATOR sealed to us, and report whether it
+    /// carried the SEC-14 version marker. A bare 32-byte key means a pre-SEC-14 peer
+    /// and keeps the old shared nonce space; 33 bytes means per-direction nonces.
+    /// Any other length or version is refused rather than guessed at.
     pub fn decode(
         symmetric_data: &[u8],
         their_pk_b: &[u8],
         our_sk_b: &box_::SecretKey,
-    ) -> ResultType<Key> {
+    ) -> ResultType<SessionKey> {
         if their_pk_b.len() != box_::PUBLICKEYBYTES {
             anyhow::bail!("Handshake failed: pk length {}", their_pk_b.len());
         }
@@ -346,11 +409,143 @@ impl Encrypt {
         let their_pk_b = box_::PublicKey(pk_);
         let symmetric_key = box_::open(symmetric_data, &nonce, &their_pk_b, &our_sk_b)
             .map_err(|_| anyhow::anyhow!("Handshake failed: box decryption failure"))?;
-        if symmetric_key.len() != secretbox::KEYBYTES {
-            anyhow::bail!("Handshake failed: invalid secret key length from peer");
-        }
+        let directional = if symmetric_key.len() == secretbox::KEYBYTES {
+            false
+        } else if symmetric_key.len() == secretbox::KEYBYTES + 1 {
+            let version = symmetric_key[secretbox::KEYBYTES];
+            if version != SESSION_KEY_V1 {
+                anyhow::bail!("Handshake failed: unknown session key version {}", version);
+            }
+            true
+        } else {
+            anyhow::bail!(
+                "Handshake failed: invalid secret key length {} from peer",
+                symmetric_key.len()
+            );
+        };
         let mut key = [0u8; secretbox::KEYBYTES];
-        key[..].copy_from_slice(&symmetric_key);
-        Ok(Key(key))
+        key[..].copy_from_slice(&symmetric_key[..secretbox::KEYBYTES]);
+        Ok(SessionKey {
+            key: Key(key),
+            role: Role::Responder,
+            directional,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BytesMut;
+
+    fn pair(directional: bool) -> (Encrypt, Encrypt) {
+        let key = secretbox::gen_key();
+        (
+            Encrypt::new(SessionKey {
+                key: key.clone(),
+                role: Role::Initiator,
+                directional,
+            }),
+            Encrypt::new(SessionKey {
+                key,
+                role: Role::Responder,
+                directional,
+            }),
+        )
+    }
+
+    /// SEC-14. The bug: one shared key plus one nonce space meant BOTH ends derived
+    /// the same nonce from their own counters, so frame #1 in each direction
+    /// encrypted the same plaintext to the same ciphertext -- XSalsa20 keystream
+    /// reuse on every connection, from the very first frame. Assert both halves:
+    /// that the old shape really did collide, and that the new one does not.
+    #[test]
+    fn directions_do_not_share_a_nonce_space() {
+        let (mut legacy_i, mut legacy_r) = pair(false);
+        assert_eq!(
+            legacy_i.enc(b"same plaintext"),
+            legacy_r.enc(b"same plaintext"),
+            "pre-SEC-14 shape: two directions, one nonce space, one key (two-time pad)"
+        );
+
+        let (mut i, mut r) = pair(true);
+        assert_ne!(
+            i.enc(b"same plaintext"),
+            r.enc(b"same plaintext"),
+            "SEC-14: the two directions must never reuse a nonce under one key"
+        );
+    }
+
+    /// Both directions must still round-trip -- a nonce split that breaks decryption
+    /// would be caught here rather than by a silent stall on a real connection.
+    #[test]
+    fn a_directional_pair_round_trips_both_ways() {
+        let (mut i, mut r) = pair(true);
+        for n in 0..4u8 {
+            let msg = [b'i', n];
+            let mut wire = BytesMut::from(&i.enc(&msg)[..]);
+            r.dec(&mut wire).expect("responder decrypts");
+            assert_eq!(&wire[..], &msg[..]);
+
+            let msg = [b'r', n];
+            let mut wire = BytesMut::from(&r.enc(&msg)[..]);
+            i.dec(&mut wire).expect("initiator decrypts");
+            assert_eq!(&wire[..], &msg[..]);
+        }
+    }
+
+    /// Against a pre-SEC-14 peer both ends fall back to the old shared nonce space,
+    /// so an un-updated peer keeps working exactly as before.
+    #[test]
+    fn a_legacy_pair_round_trips_both_ways() {
+        let (mut i, mut r) = pair(false);
+        let mut wire = BytesMut::from(&i.enc(b"hello")[..]);
+        r.dec(&mut wire).expect("responder decrypts");
+        assert_eq!(&wire[..], b"hello");
+        let mut wire = BytesMut::from(&r.enc(b"world")[..]);
+        i.dec(&mut wire).expect("initiator decrypts");
+        assert_eq!(&wire[..], b"world");
+    }
+
+    /// The initiator's SEND direction is 0, which is byte-for-byte what the old code
+    /// did in both directions. That is deliberate: it keeps the change confined to
+    /// the responder->initiator leg.
+    #[test]
+    fn the_initiator_send_leg_is_unchanged_from_the_legacy_shape() {
+        let key = secretbox::gen_key();
+        let mut v1 = Encrypt::new(SessionKey::new(key.clone(), Role::Initiator));
+        let mut legacy = Encrypt::new(SessionKey {
+            key,
+            role: Role::Initiator,
+            directional: false,
+        });
+        assert_eq!(v1.enc(b"first frame"), legacy.enc(b"first frame"));
+    }
+
+    /// Mixing the modes must FAIL to decrypt rather than silently produce garbage --
+    /// a half-updated fleet gets a clean error, never a corrupted stream.
+    #[test]
+    fn a_directional_responder_cannot_be_read_by_a_legacy_initiator() {
+        let key = secretbox::gen_key();
+        let mut v1_r = Encrypt::new(SessionKey::new(key.clone(), Role::Responder));
+        let mut legacy_i = Encrypt::new(SessionKey {
+            key,
+            role: Role::Initiator,
+            directional: false,
+        });
+        let mut wire = BytesMut::from(&v1_r.enc(b"reply")[..]);
+        assert!(legacy_i.dec(&mut wire).is_err());
+    }
+
+    /// The direction byte sits just past the counter, so it can never collide with a
+    /// sequence number however far the counter runs.
+    #[test]
+    fn the_direction_byte_sits_past_the_counter() {
+        let a = FramedStream::get_nonce(u64::MAX, 0);
+        let b = FramedStream::get_nonce(u64::MAX, 1);
+        assert_eq!(a.0[..8], b.0[..8]);
+        assert_eq!(a.0[8], 0);
+        assert_eq!(b.0[8], 1);
+        assert_ne!(a.0, b.0);
     }
 }
