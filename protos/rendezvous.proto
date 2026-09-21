@@ -208,6 +208,34 @@ message KeyExchange {
   repeated bytes keys = 1; 
 }
 
+// H5: the client's half of the rendezvous handshake, carrying a proof that this
+// machine is a provisioned fleet member (Layer 1) rather than merely a host that
+// knows the server's public key -- which is not a secret, it ships in every client
+// config and inside the host=..,key=.. licence name.
+//
+// It replaces the bare two-element KeyExchange reply. The first two fields are
+// exactly what that reply carried; the rest is the proof.
+//
+// `sig` is Ed25519 over
+//     "tbfdesk-rzv-dev-v1" || server_eph_pk || client_box_pk || sealed_key || peer_id
+// signed with the device SECRET key whose public half is `device_pub`.
+//
+// Covering `server_eph_pk` is what makes it fresh: that key is generated per
+// connection, so a captured NemoClientAuth cannot be replayed into another one. No
+// client nonce and no timestamp are needed, which deliberately keeps the clock out of
+// the connection path.
+//
+// Covering `peer_id` is what stops one leaked device key authenticating the whole
+// fleet: the server checks it against the key's registered binding, the same way the
+// management API does.
+message NemoClientAuth {
+  bytes client_box_pk = 1;
+  bytes sealed_key = 2;
+  bytes device_pub = 3;
+  string peer_id = 4;
+  bytes sig = 5;
+}
+
 message HealthCheck {
   string token = 1;
 }
@@ -256,5 +284,6 @@ message RendezvousMessage {
     HealthCheck hc = 26;
     HttpProxyRequest http_proxy_request = 27;
     HttpProxyResponse http_proxy_response = 28;
+    NemoClientAuth nemo_client_auth = 29;
   }
 }

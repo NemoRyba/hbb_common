@@ -1,3 +1,41 @@
+/// H5: the exact bytes a client's device key signs in a `NemoClientAuth`, and the exact
+/// bytes hbbs re-derives to verify it.
+///
+/// It lives in hbb_common so there is ONE definition: the SEC-14 argument-order bug is the
+/// standing reminder of what happens when the two ends of a handshake build a crypto input
+/// separately.
+///
+/// `server_eph_pk` is generated per connection, so covering it is what makes the proof
+/// fresh -- a captured `NemoClientAuth` cannot be replayed into another connection. That is
+/// deliberately a live challenge rather than a timestamp window, so the clock stays out of
+/// the connection path (the management plane's +/-300s window exists only because each
+/// sealed request there stands alone).
+///
+/// `peer_id` is covered so the proof is bound to the id the client will register as;
+/// otherwise a key bound to peer A would authenticate a connection that registers as B.
+pub const NEMO_RZV_DEVICE_AUTH_CONTEXT: &[u8] = b"tbfdesk-rzv-dev-v1";
+
+pub fn nemo_device_auth_payload(
+    server_eph_pk: &[u8; 32],
+    client_box_pk: &[u8],
+    sealed_key: &[u8],
+    peer_id: &str,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        NEMO_RZV_DEVICE_AUTH_CONTEXT.len()
+            + 32
+            + client_box_pk.len()
+            + sealed_key.len()
+            + peer_id.len(),
+    );
+    out.extend_from_slice(NEMO_RZV_DEVICE_AUTH_CONTEXT);
+    out.extend_from_slice(server_eph_pk);
+    out.extend_from_slice(client_box_pk);
+    out.extend_from_slice(sealed_key);
+    out.extend_from_slice(peer_id.as_bytes());
+    out
+}
+
 pub mod compress;
 pub mod platform;
 pub mod protos;
