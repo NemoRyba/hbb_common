@@ -4,7 +4,6 @@ use crate::{
     },
     protobuf::Message,
     socket_client::split_host_port,
-    sodiumoxide::crypto::secretbox::Key,
     tcp::Encrypt,
     tls::{get_cached_tls_accept_invalid_cert, get_cached_tls_type, upsert_tls_cache, TlsType},
     ResultType,
