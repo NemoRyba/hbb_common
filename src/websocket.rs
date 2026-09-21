@@ -236,8 +236,8 @@ impl WsFramedStream {
     }
 
     #[inline]
-    pub fn set_key(&mut self, key: Key) {
-        self.encrypt = Some(Encrypt::new(key));
+    pub fn set_key(&mut self, session: crate::tcp::SessionKey) {
+        self.encrypt = Some(Encrypt::new(session));
     }
 
     #[inline]

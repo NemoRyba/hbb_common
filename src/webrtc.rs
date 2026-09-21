@@ -413,7 +413,7 @@ impl WebRTCStream {
     }
 
     #[inline]
-    pub fn set_key(&mut self, _key: Key) {
+    pub fn set_key(&mut self, _session: crate::tcp::SessionKey) {
         // not-supported
         // WebRTC uses built-in DTLS encryption for secure communication.
         // DTLS handles key exchange and encryption automatically, so explicit key management is not required.

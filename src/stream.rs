@@ -1,7 +1,6 @@
-use crate::{config, tcp, websocket, ResultType};
+use crate::{config, tcp, tcp::SessionKey, websocket, ResultType};
 #[cfg(feature = "webrtc")]
 use crate::webrtc;
-use sodiumoxide::crypto::secretbox::Key;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
 
@@ -68,12 +67,12 @@ impl Stream {
     }
 
     #[inline]
-    pub fn set_key(&mut self, key: Key) {
+    pub fn set_key(&mut self, session: SessionKey) {
         match self {
             #[cfg(feature = "webrtc")]
-            Stream::WebRTC(s) => s.set_key(key),
-            Stream::WebSocket(s) => s.set_key(key),
-            Stream::Tcp(s) => s.set_key(key),
+            Stream::WebRTC(s) => s.set_key(session),
+            Stream::WebSocket(s) => s.set_key(session),
+            Stream::Tcp(s) => s.set_key(session),
         }
     }
 
