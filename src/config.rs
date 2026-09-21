@@ -2317,9 +2317,25 @@ impl UserDefaultConfig {
                 self.get_string(key, "scrollauto", vec!["scrolledge", "scrollbar"])
             }
             keys::OPTION_IMAGE_QUALITY => {
-                // Nemo: default to "low" (Optimize reaction time) for low-latency
-                // remote control of CAD/3D workstations.
-                self.get_string(key, "low", vec!["best", "balanced", "custom"])
+                // Was "low" here, on the reasoning that it optimises reaction time for
+                // CAD/3D workstations. That reasoning does not survive contact with how
+                // the quality ratio is actually used: MAX_BR_MULTIPLE is 1.0
+                // (server/video_qos.rs), so the chosen quality is a hard CEILING that
+                // adaptive bitrate can only ever move DOWN from. "low" therefore caps a
+                // 1080p session at ratio 0.5 (~1 Mbps) even on an idle gigabit LAN, where
+                // the extra bandwidth costs nothing in latency -- it just buys back the
+                // quantisation that smears CAD line-work and dimension text.
+                //
+                // Where bandwidth really is scarce, ABR already drops the ratio by
+                // itself, which is the mechanism that was supposed to handle this. So the
+                // low default gave up quality on good links without helping on bad ones.
+                //
+                // Back to upstream's "balanced". Sites wanting more should push
+                // image_quality=custom + custom_image_quality=300 to the LAN operators
+                // (see DEPLOY.md); `custom` is now safe over a WAN too, since its ABR
+                // floor is a fraction of the user's own target rather than the absolute
+                // 1% floor.
+                self.get_string(key, "balanced", vec!["best", "low", "custom"])
             }
             keys::OPTION_CODEC_PREFERENCE => {
                 self.get_string(key, "auto", vec!["vp8", "vp9", "av1", "h264", "h265"])
