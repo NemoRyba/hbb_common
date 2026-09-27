@@ -359,7 +359,11 @@ impl Encrypt {
     }
 
     pub fn dec(&mut self, bytes: &mut BytesMut) -> Result<(), Error> {
-        if bytes.len() <= 1 {
+        // Only the EMPTY frame is exempt: it is the keep-alive both ends send raw
+        // with send_bytes(Bytes::new()) and it carries nothing. Every sealed frame
+        // is at least a 16-byte MAC, so anything non-empty must authenticate; a
+        // 1-byte frame used to slip through here unauthenticated.
+        if bytes.is_empty() {
             return Ok(());
         }
         self.2 += 1;
@@ -454,6 +458,23 @@ mod tests {
     /// encrypted the same plaintext to the same ciphertext -- XSalsa20 keystream
     /// reuse on every connection, from the very first frame. Assert both halves:
     /// that the old shape really did collide, and that the new one does not.
+    /// A 1-byte frame used to be passed through undecrypted. Only the empty
+    /// keep-alive may skip authentication now (a decrypt error ends the
+    /// connection, so the rejected frame's counter step does not matter).
+    #[test]
+    fn only_the_empty_frame_skips_authentication() {
+        let (mut i, mut r) = pair();
+        let mut empty = BytesMut::new();
+        assert!(r.dec(&mut empty).is_ok());
+        assert!(empty.is_empty());
+        let mut one = BytesMut::from(&b"\x08"[..]);
+        assert!(r.dec(&mut one).is_err(), "unauthenticated 1-byte frame accepted");
+        let (mut i, mut r) = pair();
+        let mut sealed = BytesMut::from(&i.enc(b"x")[..]);
+        assert!(r.dec(&mut sealed).is_ok());
+        assert_eq!(&sealed[..], b"x");
+    }
+
     #[test]
     fn directions_do_not_share_a_nonce_space() {
         let (mut legacy_i, mut legacy_r) = legacy_pair();
