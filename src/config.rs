@@ -98,7 +98,11 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];
+// Standalone fork (2026-09-28): emptied to match the client's copy of this same
+// constant. Unreachable from the server's own binaries (hbbs/hbbr never call
+// get_rendezvous_servers(), a client-side config-derivation function), kept in
+// step for anyone reading this file and assuming the two copies still agree.
+pub const RENDEZVOUS_SERVERS: &[&str] = &[];
 pub const RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
