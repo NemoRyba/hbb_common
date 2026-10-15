@@ -28,6 +28,34 @@ message PunchHoleRequest {
   bool force_relay = 8;
   int32 upnp_port = 9;
   bytes socket_addr_v6 = 10;
+  // TBFDesk TODO 8: who is asking. Until this field existed the controller's identity
+  // was smuggled inside `version` as "<version> nemo-source-v1:<id>:<b64 uuid>[:token]",
+  // and on the relay path inside `licence_key` -- fields meant for something else, so
+  // every gate that keys off the controller (per-user connection ACL, require-login,
+  // per-session permissions, the blocklist) depended on a string the server had to
+  // carve up, and a client that merely omitted the marker read as "anonymous" rather
+  // than as a protocol error. A real field makes the identity explicit and typed; the
+  // old marker stays readable so an un-updated server keeps working.
+  NemoSource nemo_source = 11;
+}
+
+// TBFDesk TODO 8: the controller's own identity on a connection request.
+//
+// This is ASSERTED, not proved -- exactly like the marker it replaces. What proves a
+// controller is the device-key handshake (NemoClientAuth), which binds the whole
+// connection to one peer id; the server prefers that proof wherever both exist and
+// treats this as a hint. The value of the field is that it is unambiguous and cannot
+// collide with the version string it used to share.
+message NemoSource {
+  // The controller's own peer id.
+  string id = 1;
+  // Its machine uuid, raw rather than base64 now that it has a bytes field to live in.
+  bytes uuid = 2;
+  // The logged-in user's session token, when there is one. A bearer credential: the
+  // client attaches it ONLY on a confidential socket (see the client's
+  // nemo_source_marker), and the server reads it to resolve the user whose policy and
+  // connection ACL apply.
+  string token = 3;
 }
 
 message ControlPermissions {
@@ -146,6 +174,11 @@ message RequestRelay {
   ConnType conn_type = 7;
   string token = 8;
   ControlPermissions control_permissions = 9;
+  // TBFDesk TODO 8: see PunchHoleRequest.nemo_source. On this path the marker rode in
+  // `licence_key`, which the server has to blank before forwarding the frame to the
+  // workstation -- the field also carries the user's session token, and forwarding it
+  // whole once handed a technician's bearer token to every machine they connected to.
+  NemoSource nemo_source = 10;
 }
 
 message RelayResponse {
