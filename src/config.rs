@@ -99,6 +99,31 @@ lazy_static::lazy_static! {
 type Size = (i32, i32, i32, i32);
 type KeyPair = (Vec<u8>, Vec<u8>);
 
+/// RENAMING-PLAN Layer 1. The app's MACHINE identity: the config directory, the names of
+/// the files inside it, the Windows service, the registry subkey, the install directory,
+/// the exe file name, the IPC pipe, the log directory and the `tbfdesk://` URI scheme all
+/// derive from this one string.
+///
+/// Changing it orphans every existing install, which is why
+/// [`Config::migrate_legacy_app_name`] (Layer 2) exists and why `LEGACY_APP_NAME` below
+/// must stay as long as a machine anywhere might still hold a RustDesk-named config.
+pub const DEFAULT_APP_NAME: &str = "TBFDesk";
+
+/// The name this app shipped under before Layer 1. Everything named after it has to be
+/// found, moved and cleaned up, so it is a constant rather than a literal sprinkled
+/// through the platform code.
+pub const LEGACY_APP_NAME: &str = "RustDesk";
+
+/// What [`Config::migrate_legacy_app_name`] actually did, so the caller can log it and a
+/// test can assert on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyConfigMigration {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    /// The names the files were given in `to`, already renamed.
+    pub copied: Vec<String>,
+}
+
 lazy_static::lazy_static! {
     static ref CONFIG: RwLock<Config> = RwLock::new(Config::load());
     static ref CONFIG2: RwLock<Config2> = RwLock::new(Config2::load());
@@ -108,7 +133,7 @@ lazy_static::lazy_static! {
     static ref ONLINE: Mutex<HashMap<String, i64>> = Default::default();
     pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("".to_owned());
     pub static ref EXE_RENDEZVOUS_SERVER: RwLock<String> = Default::default();
-    pub static ref APP_NAME: RwLock<String> = RwLock::new("RustDesk".to_owned());
+    pub static ref APP_NAME: RwLock<String> = RwLock::new(DEFAULT_APP_NAME.to_owned());
     static ref KEY_PAIR: Mutex<Option<KeyPair>> = Default::default();
     static ref USER_DEFAULT_CONFIG: RwLock<(UserDefaultConfig, Instant)> = RwLock::new((UserDefaultConfig::load(), Instant::now()));
     pub static ref NEW_STORED_PEER_CONFIG: Mutex<HashSet<String>> = Default::default();
@@ -776,20 +801,140 @@ impl Config {
         }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
-            #[cfg(not(target_os = "macos"))]
-            let org = "".to_owned();
-            #[cfg(target_os = "macos")]
-            let org = ORG.read().unwrap().clone();
-            // /var/root for root
-            if let Some(project) =
-                directories_next::ProjectDirs::from("", &org, &APP_NAME.read().unwrap())
-            {
-                let mut path = patch(project.config_dir().to_path_buf());
-                path.push(p);
-                return path;
+            match Self::config_dir_of(&APP_NAME.read().unwrap()) {
+                Some(mut path) => {
+                    path.push(p);
+                    path
+                }
+                None => "".into(),
             }
-            "".into()
         }
+    }
+
+    /// The config directory an app of this name would use on this platform. Split out of
+    /// [`Config::path`] so Layer 2 can name the directory the PREVIOUS app name used --
+    /// which is not derivable by string surgery: `directories_next` normalises the
+    /// project path per platform (`~/.config/tbfdesk` on Linux, `%APPDATA%\TBFDesk` on
+    /// Windows), and `patch()` then redirects the Windows system profile.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn config_dir_of(app_name: &str) -> Option<PathBuf> {
+        #[cfg(not(target_os = "macos"))]
+        let org = "".to_owned();
+        #[cfg(target_os = "macos")]
+        let org = ORG.read().unwrap().clone();
+        // /var/root for root
+        directories_next::ProjectDirs::from("", &org, app_name)
+            .map(|project| patch(project.config_dir().to_path_buf()))
+    }
+
+    /// RENAMING-PLAN Layer 2: carry a RustDesk-named config over to the TBFDesk-named
+    /// directory, so an existing install keeps its **ID, permanent password, device key
+    /// and every setting** across the rename instead of coming up as a brand new machine
+    /// with a new ID -- which would also break its device-key binding, since a key is
+    /// pinned to a peer id.
+    ///
+    /// Two things move, and the second is the one that is easy to miss: the directory
+    /// (`%APPDATA%\RustDesk\config` -> `%APPDATA%\TBFDesk\config`,
+    /// `~/.config/rustdesk` -> `~/.config/tbfdesk`) **and the file names inside it**,
+    /// because `Config::file_()` spells them `{APP_NAME}.toml`, `{APP_NAME}2.toml`,
+    /// `{APP_NAME}_local.toml`, `{APP_NAME}_hwcodec.toml`, `{APP_NAME}_ab`,
+    /// `{APP_NAME}_group`. A directory copy alone would land `RustDesk2.toml` in the new
+    /// directory where nothing ever reads it.
+    ///
+    /// Deliberately a COPY, not a move: the old directory stays untouched, so rolling
+    /// back to a RustDesk-named build finds its config exactly where it left it.
+    ///
+    /// Safe to call on every start, in any order:
+    /// - nothing to do when this build's name IS the legacy name;
+    /// - nothing to do once the new directory has its own `{APP_NAME}.toml`, so a machine
+    ///   that has run the new build keeps its own config and never re-imports the stale
+    ///   one;
+    /// - a destination file that already exists is never overwritten;
+    /// - the in-memory config is reloaded afterwards, so it does not matter whether
+    ///   something read it before the migration ran.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn migrate_legacy_app_name() -> Option<LegacyConfigMigration> {
+        let app_name = APP_NAME.read().unwrap().clone();
+        if app_name == LEGACY_APP_NAME {
+            return None;
+        }
+        let from = Self::config_dir_of(LEGACY_APP_NAME)?;
+        let to = Self::config_dir_of(&app_name)?;
+        let copied = Self::copy_legacy_config_dir(&from, &to, LEGACY_APP_NAME, &app_name);
+        if copied.is_empty() {
+            return None;
+        }
+
+        // Order independence: whatever was read before this ran is now stale on purpose.
+        // Each value is loaded BEFORE its lock is taken, so this cannot deadlock against
+        // a loader that reads one of these itself.
+        let config = Config::load();
+        *CONFIG.write().unwrap() = config;
+        let config2 = Config2::load();
+        *CONFIG2.write().unwrap() = config2;
+        let local = LocalConfig::load();
+        *LOCAL_CONFIG.write().unwrap() = local;
+        let status = Status::load();
+        *STATUS.write().unwrap() = status;
+        let user_default = UserDefaultConfig::load();
+        *USER_DEFAULT_CONFIG.write().unwrap() = (user_default, Instant::now());
+
+        Some(LegacyConfigMigration { from, to, copied })
+    }
+
+    /// The part of the migration that only touches the filesystem, so it can be tested on
+    /// two temporary directories instead of the real profile. Returns the names it wrote
+    /// into `to`, already renamed; empty means "nothing to do", for any of the reasons.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn copy_legacy_config_dir(
+        from: &Path,
+        to: &Path,
+        legacy: &str,
+        app_name: &str,
+    ) -> Vec<String> {
+        if from == to || !from.is_dir() {
+            return Vec::new();
+        }
+        // This build has already written its own identity here -- leave it alone, or a
+        // machine that has been running the new name for weeks would be reset to whatever
+        // the old directory still holds.
+        if Self::with_extension(to.join(app_name)).exists() {
+            return Vec::new();
+        }
+        if let Err(err) = fs::create_dir_all(to) {
+            log::error!("Config migration: cannot create {:?}: {err}", to);
+            return Vec::new();
+        }
+        let entries = match fs::read_dir(from) {
+            Ok(entries) => entries,
+            Err(err) => {
+                log::error!("Config migration: cannot read {:?}: {err}", from);
+                return Vec::new();
+            }
+        };
+        let mut copied = Vec::new();
+        for entry in entries.flatten() {
+            // Only the config files themselves. The subdirectories here are `log` and the
+            // per-peer `peers` store; logs are noise, and a peer config is keyed by peer
+            // id and is rebuilt on the next connection, so neither is worth a deep copy.
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let renamed = match name.strip_prefix(legacy) {
+                Some(rest) => format!("{app_name}{rest}"),
+                None => name.clone(),
+            };
+            let dst = to.join(&renamed);
+            if dst.exists() {
+                continue;
+            }
+            match fs::copy(entry.path(), &dst) {
+                Ok(_) => copied.push(renamed),
+                Err(err) => log::error!("Config migration: {name} -> {renamed} failed: {err}"),
+            }
+        }
+        copied
     }
 
     /// Get the log directory path.
@@ -3236,6 +3381,127 @@ impl Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // RENAMING-PLAN Layer 2. These drive `copy_legacy_config_dir` rather than
+    // `migrate_legacy_app_name`, because the latter reads the real user profile and
+    // rewrites the process-wide config -- which would make the test depend on, and
+    // damage, the machine it runs on.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tbfdesk-migrate-test-{name}"));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_renamed_build_inherits_the_old_name_s_identity_file_by_file() {
+        let root = scratch("inherits");
+        let (from, to) = (root.join("RustDesk"), root.join("TBFDesk"));
+        fs::create_dir_all(&from).unwrap();
+        // The names `Config::file_()` actually writes, plus a peers subdirectory and a
+        // log file, which must NOT come along.
+        for f in [
+            "RustDesk.toml",
+            "RustDesk.toml.bak",
+            "RustDesk2.toml",
+            "RustDesk_local.toml",
+            "RustDesk_hwcodec.toml",
+            "RustDesk_ab",
+            "RustDesk_group",
+        ] {
+            fs::write(from.join(f), format!("marker for {f}")).unwrap();
+        }
+        fs::create_dir_all(from.join("peers")).unwrap();
+        fs::write(from.join("peers").join("123456.toml"), "peer").unwrap();
+
+        let mut copied = Config::copy_legacy_config_dir(&from, &to, "RustDesk", "TBFDesk");
+        copied.sort();
+        assert_eq!(
+            copied,
+            vec![
+                "TBFDesk.toml",
+                "TBFDesk.toml.bak",
+                "TBFDesk2.toml",
+                "TBFDesk_ab",
+                "TBFDesk_group",
+                "TBFDesk_hwcodec.toml",
+                "TBFDesk_local.toml",
+            ]
+        );
+        // The ID and the options have to arrive under the name the new build reads, not
+        // just in the new directory: `Config::file_()` spells them `{APP_NAME}{suffix}`.
+        assert_eq!(
+            fs::read_to_string(to.join("TBFDesk2.toml")).unwrap(),
+            "marker for RustDesk2.toml"
+        );
+        assert!(!to.join("RustDesk2.toml").exists());
+        assert!(!to.join("peers").exists(), "subdirectories are not copied");
+        // A copy, not a move: the old directory is the rollback path.
+        assert!(from.join("RustDesk.toml").exists());
+    }
+
+    #[test]
+    fn a_machine_that_already_runs_the_new_name_is_left_alone() {
+        let root = scratch("already");
+        let (from, to) = (root.join("RustDesk"), root.join("TBFDesk"));
+        fs::create_dir_all(&from).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        fs::write(from.join("RustDesk.toml"), "stale").unwrap();
+        fs::write(from.join("RustDesk2.toml"), "stale").unwrap();
+        fs::write(to.join("TBFDesk.toml"), "current").unwrap();
+
+        assert!(Config::copy_legacy_config_dir(&from, &to, "RustDesk", "TBFDesk").is_empty());
+        assert_eq!(fs::read_to_string(to.join("TBFDesk.toml")).unwrap(), "current");
+        assert!(
+            !to.join("TBFDesk2.toml").exists(),
+            "a half-migration must not resurrect options from the old directory"
+        );
+    }
+
+    #[test]
+    fn migrating_twice_changes_nothing_the_second_time() {
+        let root = scratch("twice");
+        let (from, to) = (root.join("RustDesk"), root.join("TBFDesk"));
+        fs::create_dir_all(&from).unwrap();
+        fs::write(from.join("RustDesk.toml"), "original").unwrap();
+
+        assert_eq!(
+            Config::copy_legacy_config_dir(&from, &to, "RustDesk", "TBFDesk"),
+            vec!["TBFDesk.toml"]
+        );
+        // Something happened in between -- a new id, a new password.
+        fs::write(to.join("TBFDesk.toml"), "changed since").unwrap();
+        assert!(Config::copy_legacy_config_dir(&from, &to, "RustDesk", "TBFDesk").is_empty());
+        assert_eq!(
+            fs::read_to_string(to.join("TBFDesk.toml")).unwrap(),
+            "changed since"
+        );
+    }
+
+    #[test]
+    fn there_is_nothing_to_migrate_on_a_machine_that_never_had_the_old_name() {
+        let root = scratch("fresh");
+        let (from, to) = (root.join("RustDesk"), root.join("TBFDesk"));
+        assert!(Config::copy_legacy_config_dir(&from, &to, "RustDesk", "TBFDesk").is_empty());
+        assert!(!to.exists(), "a fresh machine gets no empty directory");
+    }
+
+    #[test]
+    fn a_build_whose_name_is_the_legacy_name_migrates_nothing() {
+        let root = scratch("same-name");
+        let dir = root.join("RustDesk");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("RustDesk.toml"), "x").unwrap();
+        assert!(Config::copy_legacy_config_dir(&dir, &dir, "RustDesk", "RustDesk").is_empty());
+    }
+
+    #[test]
+    fn the_app_name_this_build_ships_with_is_the_one_is_custom_client_compares_against() {
+        // If these ever drift, `is_custom_client()` and `is_rustdesk()` silently flip and
+        // take the "powered by" link and five option defaults with them.
+        assert_eq!(*APP_NAME.read().unwrap(), DEFAULT_APP_NAME);
+        assert_ne!(DEFAULT_APP_NAME, LEGACY_APP_NAME);
+    }
 
     #[test]
     fn test_serialize() {
