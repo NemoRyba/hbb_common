@@ -104,6 +104,17 @@ impl DerefMut for DynTcpStream {
     }
 }
 
+/// One address's connect error, in words that say who stopped it.
+fn connect_failure(addr: SocketAddr, e: &std::io::Error) -> String {
+    use std::io::ErrorKind::*;
+    match e.kind() {
+        ConnectionRefused => format!("{addr}: connection refused"),
+        ConnectionReset => format!("{addr}: connection reset"),
+        TimedOut => format!("{addr}: timed out"),
+        _ => format!("{addr}: {e}"),
+    }
+}
+
 pub(crate) fn new_socket(addr: std::net::SocketAddr, reuse: bool) -> Result<TcpSocket, std::io::Error> {
     let socket = match addr {
         std::net::SocketAddr::V4(..) => TcpSocket::new_v4()?,
@@ -128,28 +139,39 @@ impl FramedStream {
         local_addr: Option<SocketAddr>,
         ms_timeout: u64,
     ) -> ResultType<Self> {
+        // Why each address failed. "Failed to connect" alone hides the one fact a
+        // support exchange needs: refused means something answered and turned the
+        // connection away (no listener, or a router rejecting the port), a timeout means
+        // the packets were silently dropped (no route, or a firewall dropping).
+        let mut why = Vec::new();
         for remote_addr in lookup_host(&remote_addr).await? {
             let local = if let Some(addr) = local_addr {
                 addr
             } else {
                 crate::config::Config::get_any_listen_addr(remote_addr.is_ipv4())
             };
-            if let Ok(socket) = new_socket(local, true) {
-                if let Ok(Ok(stream)) =
-                    super::timeout(ms_timeout, socket.connect(remote_addr)).await
-                {
-                    stream.set_nodelay(true).ok();
-                    let addr = stream.local_addr()?;
-                    return Ok(Self(
-                        Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
-                        addr,
-                        None,
-                        0,
-                    ));
-                }
+            match new_socket(local, true) {
+                Ok(socket) => match super::timeout(ms_timeout, socket.connect(remote_addr)).await {
+                    Ok(Ok(stream)) => {
+                        stream.set_nodelay(true).ok();
+                        let addr = stream.local_addr()?;
+                        return Ok(Self(
+                            Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
+                            addr,
+                            None,
+                            0,
+                        ));
+                    }
+                    Ok(Err(e)) => why.push(connect_failure(remote_addr, &e)),
+                    Err(_) => why.push(format!("{remote_addr}: timed out after {ms_timeout} ms")),
+                },
+                Err(e) => why.push(format!("{remote_addr}: no local socket ({e})")),
             }
         }
-        bail!(format!("Failed to connect to {remote_addr}"));
+        if why.is_empty() {
+            bail!(format!("Failed to connect to {remote_addr}: the name resolved to no address"));
+        }
+        bail!(format!("Failed to connect to {remote_addr} ({})", why.join("; ")));
     }
 
     pub async fn connect<'t, T>(
@@ -550,6 +572,36 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(v2_err.contains("unknown session key version"), "{}", v2_err);
+    }
+
+    /// A refused connect and a dropped one must read differently: one means a device
+    /// answered and rejected the port, the other that nothing answered at all.
+    #[tokio::test]
+    async fn a_failed_connect_says_whether_it_was_refused_or_timed_out() {
+        // Refused: a port that was just listening and is now closed.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let err = FramedStream::new(format!("127.0.0.1:{port}"), None, 2000)
+            .await
+            .err()
+            .expect("nothing listens there")
+            .to_string();
+        assert!(err.starts_with("Failed to connect to"), "{err}");
+        assert!(err.contains("connection refused"), "{err}");
+
+        // Dropped: TEST-NET-1 is never routed, so the SYN goes nowhere.
+        let err = FramedStream::new("192.0.2.1:21666", None, 300)
+            .await
+            .err()
+            .expect("TEST-NET-1 is not reachable")
+            .to_string();
+        assert!(err.starts_with("Failed to connect to"), "{err}");
+        assert!(
+            err.contains("timed out") || err.contains("unreachable"),
+            "a dropped SYN is a timeout (or no route), never 'refused': {err}"
+        );
     }
 
     /// The direction byte sits just past the counter, so it can never collide with a
