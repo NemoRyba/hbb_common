@@ -65,9 +65,17 @@ impl ServerCertVerifier for NoVerifier {
 // this is exactly what lets it accept the nemo-api's self-signed cert by bare IP while
 // still refusing ANY other certificate (defeats the accept-any-invalid-cert MITM). The
 // fingerprint is SHA-256 of the leaf DER, matching the server's cert_fingerprint().
+//
+// The fingerprint says WHICH certificate; only the handshake signature proves the peer
+// holds its PRIVATE key. A certificate is public (every client is sent it, the setup
+// dialog shows it), so a verifier that skips the signature checks lets anyone with a copy
+// present the pinned certificate and run the key exchange with his own key. Both
+// checks below therefore run the provider's real signature verification against the
+// pinned certificate's public key.
 #[derive(Debug)]
 pub(crate) struct PinnedVerifier {
     pub fingerprint: [u8; 32],
+    pub algs: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
 impl ServerCertVerifier for PinnedVerifier {
@@ -89,53 +97,47 @@ impl ServerCertVerifier for PinnedVerifier {
         }
     }
 
-    // The pin authenticates the exact leaf, so the handshake-signature checks are not the
-    // security boundary here (same reasoning as NoVerifier); accept the schemes.
+    // Proof of possession: the peer signed the handshake with the private key that
+    // belongs to the (pinned) certificate it presented.
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls_pki_types::CertificateDer,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TLSError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls_pki_types::CertificateDer,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TLSError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA1,
-            SignatureScheme::ECDSA_SHA1_Legacy,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP521_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ED25519,
-            SignatureScheme::ED448,
-        ]
+        self.algs.supported_schemes()
     }
 }
 
 /// A4: build a rustls ClientConfig that pins the server leaf to `fingerprint`
-/// (SHA-256 of the DER). Rejects every other certificate.
+/// (SHA-256 of the DER). Rejects every other certificate, and a pinned certificate
+/// presented by a peer that cannot sign with its private key.
 pub fn client_config_pinned(fingerprint: [u8; 32]) -> ResultType<ClientConfig> {
-    let config = ClientConfig::builder()
+    Ok(pinned_config(ClientConfig::builder(), fingerprint))
+}
+
+fn pinned_config(
+    builder: rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier>,
+    fingerprint: [u8; 32],
+) -> ClientConfig {
+    let algs = builder.crypto_provider().signature_verification_algorithms;
+    builder
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedVerifier { fingerprint }))
-        .with_no_client_auth();
-    Ok(config)
+        .with_custom_certificate_verifier(Arc::new(PinnedVerifier { fingerprint, algs }))
+        .with_no_client_auth()
 }
 
 /// A certificate verifier that tries a primary verifier first,
@@ -332,4 +334,118 @@ pub fn client_config_danger() -> ResultType<ClientConfig> {
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
         .with_no_client_auth();
     Ok(config)
+}
+
+#[cfg(test)]
+mod pinned_tests {
+    //! The pin must hold against a man in the middle who has a copy of the (public)
+    //! pinned certificate. Throwaway P-256 test material: certificate A with its key A,
+    //! a stranger's key B, and an unrelated certificate C with key C.
+    use super::*;
+    use base64::Engine;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio_rustls::rustls::{
+        server::{ClientHello, ResolvesServerCert},
+        sign::CertifiedKey,
+        ClientConnection, ServerConfig, ServerConnection, SupportedProtocolVersion,
+    };
+
+    const A_CRT: &str = "MIIBgDCCASegAwIBAgIURvuXCn8+FT9bvFmuCJJvIcaqWgwwCgYIKoZIzj0EAwIwFTETMBEGA1UEAwwKcGluLXRlc3QtYTAgFw0yNjEwMTkyMDQ1MTJaGA8yMTI2MDkyNTIwNDUxMlowFTETMBEGA1UEAwwKcGluLXRlc3QtYTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABIdnHkYD07AQE04Syv+pPX48fvsm/znHKBxjXwRX149o+KKn0xB39BWtvsopyWzWAE5QyPYFK8qkn7TCFSx9ELujUzBRMB0GA1UdDgQWBBQm1wzLPB7+LKP+9tiMeAo9+d/K3TAfBgNVHSMEGDAWgBQm1wzLPB7+LKP+9tiMeAo9+d/K3TAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIG7BjRCraRTE5f0k9f45qEtTJwvMQeUkjq7Q6p7zxpaKAiAFweP/P40BE2mX7JBxbiSLzZRkZjyeJddCJmOdjkJS6w==";
+    const A_KEY: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg+bFPvdcdFuTzOwUOSXuY0qyXwvUcADljlJLPAeK9OLShRANCAASHZx5GA9OwEBNOEsr/qT1+PH77Jv85xygcY18EV9ePaPiip9MQd/QVrb7KKcls1gBOUMj2BSvKpJ+0whUsfRC7";
+    const B_KEY: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgYs+amihqko1YGLrl3K1CoGzHj+pYDfbiYyh4bc8fYQ6hRANCAARpzNBrzbjpWAOcGuk5YwaIG25LqOn9UAfXHPggGSXnQEszOLSumfpb92/iXS/0VD9+7uU4A1DmaYHvwwnZ0SAg";
+    const C_CRT: &str = "MIIBgjCCASegAwIBAgIUdU5B/m0mk/wAQwtZfNLM1ofIHZgwCgYIKoZIzj0EAwIwFTETMBEGA1UEAwwKcGluLXRlc3QtYzAgFw0yNjEwMTkyMDQ1MTJaGA8yMTI2MDkyNTIwNDUxMlowFTETMBEGA1UEAwwKcGluLXRlc3QtYzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPRyDnbu+mwOzwxoqedvG/1onOK3nkx1NXviklaNxcXM3JSa9Qtf52IBKC4hd3Z7anXP1OSqbwk8Ei4h3McbLlKjUzBRMB0GA1UdDgQWBBQrqtoe/7v9Mc2ACLhRIj6tY05azTAfBgNVHSMEGDAWgBQrqtoe/7v9Mc2ACLhRIj6tY05azTAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0kAMEYCIQDdWaAqujhbbf1qo8KWjdd6GhIRpVgjxZf3/qUmAaGXugIhAJtydxKgAWyzeq5fdjruxzU3xPlcwt73kRzLJPVDOOoz";
+    const C_KEY: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgeG9FxywvsBSh/HBJHIl3tNyRWK1o5E+8ZqK3fRFHsW6hRANCAAT0cg527vpsDs8MaKnnbxv9aJzit55MdTV74pJWjcXFzNyUmvULX+diASguIXd2e2p1z9Tkqm8JPBIuIdzHGy5S";
+
+    fn der(s: &str) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+    }
+
+    fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+        Arc::new(rustls::crypto::ring::default_provider())
+    }
+
+    #[derive(Debug)]
+    struct Fixed(Arc<CertifiedKey>);
+    impl ResolvesServerCert for Fixed {
+        fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// A server that presents `cert` and signs the handshake with `key`.
+    fn server(cert: &str, key: &str) -> ServerConnection {
+        let p = provider();
+        let signing = p
+            .key_provider
+            .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der(key))))
+            .unwrap();
+        let ck = Arc::new(CertifiedKey::new(vec![CertificateDer::from(der(cert))], signing));
+        let cfg = ServerConfig::builder_with_provider(p)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(Fixed(ck)));
+        ServerConnection::new(Arc::new(cfg)).unwrap()
+    }
+
+    /// A client pinned to `pin_cert`, as the TBFDesk API client is.
+    fn client(pin_cert: &str, version: &'static SupportedProtocolVersion) -> ClientConnection {
+        let fp = sodiumoxide::crypto::hash::sha256::hash(&der(pin_cert)).0;
+        let builder = ClientConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[version])
+            .unwrap();
+        let name: ServerName<'static> = std::convert::TryFrom::try_from("10.0.0.1").unwrap();
+        ClientConnection::new(Arc::new(pinned_config(builder, fp)), name).unwrap()
+    }
+
+    fn handshake(c: &mut ClientConnection, s: &mut ServerConnection) -> Result<(), TLSError> {
+        for _ in 0..20 {
+            let mut buf = Vec::new();
+            while c.wants_write() {
+                c.write_tls(&mut buf).unwrap();
+            }
+            if !buf.is_empty() {
+                s.read_tls(&mut &buf[..]).unwrap();
+                s.process_new_packets()?;
+            }
+            let mut buf = Vec::new();
+            while s.wants_write() {
+                s.write_tls(&mut buf).unwrap();
+            }
+            if !buf.is_empty() {
+                c.read_tls(&mut &buf[..]).unwrap();
+                c.process_new_packets()?;
+            }
+            if !c.is_handshaking() && !s.is_handshaking() {
+                return Ok(());
+            }
+        }
+        Err(TLSError::General("handshake did not finish".to_owned()))
+    }
+
+    #[test]
+    fn the_pinned_server_is_accepted() {
+        for v in [&rustls::version::TLS13, &rustls::version::TLS12] {
+            let r = handshake(&mut client(A_CRT, v), &mut server(A_CRT, A_KEY));
+            assert!(r.is_ok(), "{:?}: {:?}", v, r);
+        }
+    }
+
+    #[test]
+    fn a_copy_of_the_pinned_certificate_without_its_key_is_refused() {
+        // The man in the middle presents the real certificate A but can only sign with
+        // his own key B.
+        for v in [&rustls::version::TLS13, &rustls::version::TLS12] {
+            let r = handshake(&mut client(A_CRT, v), &mut server(A_CRT, B_KEY));
+            assert!(r.is_err(), "{:?}: a stranger's key was accepted for the pinned certificate", v);
+        }
+    }
+
+    #[test]
+    fn any_other_certificate_is_refused() {
+        for v in [&rustls::version::TLS13, &rustls::version::TLS12] {
+            let r = handshake(&mut client(A_CRT, v), &mut server(C_CRT, C_KEY));
+            assert!(r.is_err(), "{:?}: an unpinned certificate was accepted", v);
+        }
+    }
 }
