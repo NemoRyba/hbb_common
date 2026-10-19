@@ -88,6 +88,12 @@ message LoginRequest {
   string my_platform = 13;
   bytes hwid = 14;
   string avatar = 17;
+  // TBFDesk management authorization (src/nemo_control.rs): the server-signed ticket
+  // naming this controller, its user, its permissions and the machines it may control,
+  // and this device's signature over the target's challenge. High field numbers so an
+  // upstream addition can never collide with them.
+  string nemo_control_ticket = 1001;
+  bytes nemo_control_sig = 1002;
 }
 
 message Terminal {
