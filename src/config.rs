@@ -2066,7 +2066,9 @@ impl PeerConfig {
         D: de::Deserializer<'de>,
     {
         let v: Vec<i32> = de::Deserialize::deserialize(deserializer)?;
-        if v.len() == 1 && v[0] >= 10 && v[0] <= 0xFFF {
+        // TBFDesk: the custom quality slider goes down to 1 % (was 10 %). With 10 here a
+        // saved 1-9 % was silently replaced by the default on the next load.
+        if v.len() == 1 && v[0] >= 1 && v[0] <= 0xFFF {
             Ok(v)
         } else {
             Ok(Self::default_custom_image_quality())
@@ -2485,7 +2487,8 @@ impl UserDefaultConfig {
             keys::OPTION_CODEC_PREFERENCE => {
                 self.get_string(key, "auto", vec!["vp8", "vp9", "av1", "h264", "h265"])
             }
-            keys::OPTION_CUSTOM_IMAGE_QUALITY => self.get_num_string(key, 50.0, 10.0, 0xFFF as f64),
+            // TBFDesk: minimum 1 % (see deserialize_custom_image_quality).
+            keys::OPTION_CUSTOM_IMAGE_QUALITY => self.get_num_string(key, 50.0, 1.0, 0xFFF as f64),
             keys::OPTION_CUSTOM_FPS => self.get_num_string(key, 30.0, 5.0, 120.0),
             keys::OPTION_ENABLE_FILE_COPY_PASTE => self.get_string(key, "Y", vec!["", "N"]),
             keys::OPTION_EDGE_SCROLL_EDGE_THICKNESS => self.get_num_string(key, 100, 20, 150),
