@@ -1366,7 +1366,19 @@ impl Config {
 
     pub fn set_options(mut v: HashMap<String, String>) {
         Self::purify_options(&mut v);
+        // TBFDesk: a key the managed policy holds in OVERWRITE is not the caller's to
+        // change, and its stored copy is the durable fallback the client starts with
+        // (api-server, the cert pin, ...). purify_options drops it from `v`, and the map
+        // REPLACES the stored one, so every settings save used to erase that copy. Keep
+        // the stored value instead. (Snapshot the keys first: never hold CONFIG2's write
+        // lock while waiting for OVERWRITE_SETTINGS.)
+        let managed: Vec<String> = OVERWRITE_SETTINGS.read().unwrap().keys().cloned().collect();
         let mut config = CONFIG2.write().unwrap();
+        for k in managed {
+            if let Some(stored) = config.options.get(&k) {
+                v.insert(k, stored.clone());
+            }
+        }
         if config.options == v {
             return;
         }
