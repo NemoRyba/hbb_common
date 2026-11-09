@@ -2469,9 +2469,16 @@ impl UserDefaultConfig {
     pub fn get(&self, key: &str) -> String {
         match key {
             #[cfg(any(target_os = "android", target_os = "ios"))]
-            keys::OPTION_VIEW_STYLE => self.get_string(key, "adaptive", vec!["original"]),
+            keys::OPTION_VIEW_STYLE => {
+                self.get_string(key, "adaptive", vec!["original", "shrink", "stretch"])
+            }
+            // TBFDesk: the desktop default is "shrink" (scale a larger remote screen down,
+            // never enlarge), and the user default may be any of the four styles both UIs
+            // offer: Original, Adaptive (fit both ways), Shrink (down only), Stretch (up only).
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            keys::OPTION_VIEW_STYLE => self.get_string(key, "original", vec!["adaptive"]),
+            keys::OPTION_VIEW_STYLE => {
+                self.get_string(key, "shrink", vec!["original", "adaptive", "stretch"])
+            }
             keys::OPTION_SCROLL_STYLE => {
                 self.get_string(key, "scrollauto", vec!["scrolledge", "scrollbar"])
             }
