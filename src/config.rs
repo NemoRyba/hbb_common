@@ -959,10 +959,14 @@ impl Config {
             std::fs::create_dir_all(&path).ok();
             return path;
         }
+        // TBFDesk: in the app's private directory (next to the config), not in the shared
+        // storage root (<home>/TBFDesk/Logs). Since Android 11 an app may only create that
+        // top-level folder with "all files access", which is asked for only for file
+        // transfer -- so without it there was no log at all and "Share log" had nothing.
         #[cfg(target_os = "android")]
         {
-            let mut path = Self::get_home();
-            path.push(format!("{}/Logs", *APP_NAME.read().unwrap()));
+            let mut path: PathBuf = APP_DIR.read().unwrap().clone().into();
+            path.push("Logs");
             std::fs::create_dir_all(&path).ok();
             return path;
         }
